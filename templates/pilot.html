@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block title %}试点对比 · 电池寿命分析{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>试点组 / 非试点组故障率对比</h1>
+  <p class="hint">
+    按随访当天是否已开始试点分组、按随访当天机龄是否满 180 天分层。
+    故障当天计一天随访，故障只记入当天所在的组和层。日期范围含首尾两天（UTC）。
+  </p>
+  <form method="get" action="{{ url_for('pilot_page') }}" class="cutoff-form">
+    <label for="start">开始日（UTC）</label>
+    <input id="start" name="start" type="date" value="{{ start_text }}">
+    <label for="end">结束日（UTC）</label>
+    <input id="end" name="end" type="date" value="{{ end_text }}">
+    <button type="submit">比较</button>
+  </form>
+
+  {% if errors %}
+  <div class="alert" role="alert">
+    <ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  {% if result %}
+  <div class="stats">
+    <div><span class="stat-value">{{ result.total_days }}</span><span class="stat-label">随访电池日合计</span></div>
+    <div><span class="stat-value">{{ result.total_failures }}</span><span class="stat-label">故障数合计</span></div>
+  </div>
+
+  <h2>分层随访电池日与故障数（{{ result.start.isoformat() }} 至 {{ result.end.isoformat() }}，含首尾）</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>机龄层</th>
+          <th>组别</th>
+          <th>随访电池日</th>
+          <th>故障数</th>
+          <th>每千随访电池日故障率</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in cell_rows %}
+        <tr>
+          <td>{{ row.layer_label }}</td>
+          <td>{{ row.group_label }}</td>
+          <td>{{ row.days }}</td>
+          <td>{{ row.failures }}</td>
+          <td>{% if row.rate_per_1000 is not none %}{{ "%.3f"|format(row.rate_per_1000) }}{% else %}—{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if result.comparable %}
+  <h2>按共同机龄层加权的故障率</h2>
+  <p class="hint">
+    只使用两组都有随访的层；层权重 = 该层两组合计随访电池日 ÷ 这些层的总随访电池日。
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>机龄层</th><th>两组合计随访电池日</th><th>权重</th></tr>
+      </thead>
+      <tbody>
+        {% for row in weight_rows %}
+        <tr>
+          <td>{{ row.layer_label }}</td>
+          <td>{{ row.days }}</td>
+          <td>{{ "%.4f"|format(row.weight) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="stats">
+    <div>
+      <span class="stat-value">{{ "%.3f"|format(result.pilot_rate_per_1000) }}</span>
+      <span class="stat-label">试点组加权故障率（每千随访电池日）</span>
+    </div>
+    <div>
+      <span class="stat-value">{{ "%.3f"|format(result.control_rate_per_1000) }}</span>
+      <span class="stat-label">非试点组加权故障率（每千随访电池日）</span>
+    </div>
+    <div>
+      <span class="stat-value">{{ "%.3f"|format(result.difference_per_1000) }}</span>
+      <span class="stat-label">差值（试点 − 非试点）</span>
+    </div>
+  </div>
+  {% else %}
+  <p class="empty">所选范围内两组没有共同随访的机龄层，无法比较。</p>
+  {% endif %}
+  {% elif not errors %}
+  <p class="empty">请选择含首尾的 UTC 日期范围开始比较。</p>
+  {% endif %}
+</section>
+
+<section class="panel">
+  <h2>口径说明</h2>
+  <p>
+    机龄 = 随访日期 − 启用日（天）。每个随访日按当天是否已满 180 天划入对应机龄层，
+    按当天是否已到该电池的试点开始日划入试点组或非试点组；跨层、跨组的随访会在边界日自动切开，
+    不会逐日展开。故障当天计一天随访，故障只记入当天所在的组和层。
+    加权故障率仅取两组都有随访的机龄层，按各层两组合计随访电池日的占比加权，
+    单位为每千随访电池日；差值为试点组减去非试点组。
+    试点名单见<a href="{{ url_for('roster_page') }}">试点名单</a>页，名单更正后分段汇总会即时重算。
+  </p>
+</section>
+{% endblock %}

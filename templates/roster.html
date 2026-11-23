@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block title %}试点名单 · 电池寿命分析{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>试点名单</h1>
+  <p class="hint">
+    上传试点名单 CSV（电池号、UTC 试点开始日）。同一电池号再次上传即为更正（覆盖旧开始日）；
+    名单可以先于随访登记，随访导入后会自动按名单分组。整份文件先校验再写入，
+    任一行出错则整份拒绝，原有名单和对比结果照常可查。
+  </p>
+
+  {% if errors %}
+  <div class="alert" role="alert">
+    <strong>导入失败，本次未做任何更改：</strong>
+    <ul>
+      {% for error in errors %}<li>{{ error }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <form method="post" enctype="multipart/form-data" class="upload-form">
+    <label for="file">CSV 文件</label>
+    <input id="file" name="file" type="file" accept=".csv,text/csv" required>
+    <button type="submit">导入名单</button>
+  </form>
+
+  <h2>文件格式</h2>
+  <p>
+    必需列：<code>battery_no</code>（电池号）、<code>pilot_start</code>（试点开始日，UTC，
+    <code>YYYY-MM-DD</code>；也接受 <code>YYYY/MM/DD</code> 与带时区的 ISO 8601 时间戳，
+    带时区的时间会先换算为 UTC 再取日期）。可选列 <code>action</code>：
+    <code>insert</code> / <code>update</code> / <code>delete</code>（或“补录 / 更正 / 删除”），
+    留空时自动判断：新电池号新增，已在名单中则视为更正。
+    文件内电池号必须唯一；UTF-8 或 GB18030 编码。
+  </p>
+  <p><a href="{{ url_for('roster_template_csv') }}">下载名单模板 CSV</a></p>
+
+  <h2>当前名单</h2>
+  {% if entries %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>电池号</th><th>试点开始日（UTC）</th><th>最近更新（UTC）</th></tr>
+      </thead>
+      <tbody>
+        {% for entry in entries %}
+        <tr>
+          <td>{{ entry["battery_no"] }}</td>
+          <td>{{ entry["pilot_start"] }}</td>
+          <td>{{ entry["updated_at"] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">名单为空。未在名单中的电池，其随访一律计入非试点组。</p>
+  {% endif %}
+
+  <h2>最近的名单导入批次</h2>
+  {% if batches %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>批次</th><th>文件</th><th>时间 (UTC)</th><th>行数</th><th>新增</th><th>更正</th><th>删除</th><th>未变化</th></tr>
+      </thead>
+      <tbody>
+        {% for batch in batches %}
+        <tr>
+          <td>{{ batch["id"] }}</td>
+          <td>{{ batch["filename"] }}</td>
+          <td>{{ batch["imported_at"] }}</td>
+          <td>{{ batch["total_rows"] }}</td>
+          <td>{{ batch["inserted"] }}</td>
+          <td>{{ batch["updated"] }}</td>
+          <td>{{ batch["deleted"] }}</td>
+          <td>{{ batch["unchanged"] }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">还没有名单导入记录。</p>
+  {% endif %}
+</section>
+{% endblock %}

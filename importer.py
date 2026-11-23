@@ -12,6 +12,7 @@ from typing import Iterable, Sequence
 from db import (
     MAX_SUMMARY_RECORDS_PER_BATTERY,
     apply_summary_changes,
+    rebuild_segments_for,
     record_usage,
     summary_from_values,
     usage_for,
@@ -95,6 +96,22 @@ HEADER_ALIASES = {
         "状态",
         "随访结局",
     },
+    "pilot_start": {
+        "pilot_start",
+        "pilot_start_date",
+        "pilot_begin",
+        "pilot_begin_date",
+        "trial_start",
+        "trial_start_date",
+        "pilot_date",
+        "试点开始日",
+        "试点开始日期",
+        "试点开始",
+        "试点日期",
+        "试点起始日",
+        "加入试点日",
+        "加入试点日期",
+    },
     "action": {
         "action",
         "operation",
@@ -158,6 +175,7 @@ FIELD_LABELS = {
     "followup_start": "随访首日",
     "followup_end": "随访末日",
     "outcome": "结局",
+    "pilot_start": "试点开始日",
 }
 
 
@@ -214,6 +232,24 @@ class ImportResult:
     deleted: int
     unchanged: int
     summary_records: int
+    batch_id: int
+
+
+@dataclass(frozen=True)
+class RosterRecord:
+    battery_no: str
+    pilot_start: date | None
+    action: str
+    line_no: int
+
+
+@dataclass(frozen=True)
+class RosterResult:
+    total_rows: int
+    inserted: int
+    updated: int
+    deleted: int
+    unchanged: int
     batch_id: int
 
 
@@ -318,8 +354,8 @@ def _parse_action(raw: str, line_no: int) -> str:
     return action
 
 
-def parse_csv(data: bytes, *, max_rows: int = MAX_ROWS) -> list[FollowupRecord]:
-    """Parse and validate a CSV without touching the database."""
+def _read_table(data: bytes, max_rows: int) -> tuple[list[str], list[tuple[int, list[str]]]]:
+    """Decode a CSV and return (header, [(line_no, row), ...])."""
 
     if not data or not data.strip():
         raise ImportValidationError("上传的文件为空。")
@@ -343,6 +379,11 @@ def parse_csv(data: bytes, *, max_rows: int = MAX_ROWS) -> list[FollowupRecord]:
         raise ImportValidationError("CSV 没有数据行。")
     if len(rows) > max_rows:
         raise ImportValidationError(f"CSV 数据行超过上限（最多 {max_rows} 行）。")
+    return header, rows
+
+
+def _map_columns(header: list[str], required: Sequence[str]) -> dict[str, int]:
+    """Map canonical column names to indexes, validating required columns."""
 
     columns: dict[str, int] = {}
     errors: list[str] = []
@@ -355,15 +396,39 @@ def parse_csv(data: bytes, *, max_rows: int = MAX_ROWS) -> list[FollowupRecord]:
         else:
             columns[canonical] = index
 
-    missing = [field for field in REQUIRED_FIELDS if field not in columns]
+    missing = [field for field in required if field not in columns]
     if missing:
         errors.append(
             "CSV 缺少列：" + "、".join(FIELD_LABELS[field] for field in missing) + "。"
         )
     if errors:
         raise ImportValidationError(errors)
+    return columns
+
+
+def _battery_no_error(battery_no: str, line_no: int, seen: set[str]) -> str | None:
+    if not battery_no:
+        return f"第 {line_no} 行：电池号不能为空。"
+    if len(battery_no) > MAX_BATTERY_NO_LENGTH:
+        return f"第 {line_no} 行：电池号超过 {MAX_BATTERY_NO_LENGTH} 个字符。"
+    if any(ord(char) < 32 for char in battery_no):
+        return f"第 {line_no} 行：电池号含有不可见控制字符。"
+    if battery_no in seen:
+        return (
+            f"第 {line_no} 行：电池号“{battery_no}”在文件内重复；"
+            "同一文件内电池号必须唯一。"
+        )
+    return None
+
+
+def parse_csv(data: bytes, *, max_rows: int = MAX_ROWS) -> list[FollowupRecord]:
+    """Parse and validate a CSV without touching the database."""
+
+    header, rows = _read_table(data, max_rows)
+    columns = _map_columns(header, REQUIRED_FIELDS)
 
     records: list[FollowupRecord] = []
+    errors: list[str] = []
     seen: set[str] = set()
     for line_no, row in rows:
         if len(row) > len(header):
@@ -379,22 +444,9 @@ def parse_csv(data: bytes, *, max_rows: int = MAX_ROWS) -> list[FollowupRecord]:
             return row[index] if index is not None and index < len(row) else ""
 
         battery_no = cell("battery_no").strip()
-        if not battery_no:
-            errors.append(f"第 {line_no} 行：电池号不能为空。")
-            continue
-        if len(battery_no) > MAX_BATTERY_NO_LENGTH:
-            errors.append(
-                f"第 {line_no} 行：电池号超过 {MAX_BATTERY_NO_LENGTH} 个字符。"
-            )
-            continue
-        if any(ord(char) < 32 for char in battery_no):
-            errors.append(f"第 {line_no} 行：电池号含有不可见控制字符。")
-            continue
-        if battery_no in seen:
-            errors.append(
-                f"第 {line_no} 行：电池号“{battery_no}”在文件内重复；"
-                "同一文件内电池号必须唯一。"
-            )
+        problem = _battery_no_error(battery_no, line_no, seen)
+        if problem:
+            errors.append(problem)
             continue
         seen.add(battery_no)
 
@@ -665,6 +717,13 @@ def apply_import(conn, filename: str, records: Sequence[FollowupRecord]) -> Impo
 
         apply_summary_changes(conn, changes)
 
+        # Rebuild comparison segments only for the batteries this batch
+        # touches; unchanged rows keep their existing segments.
+        rebuild_segments_for(
+            conn,
+            [plan.record.battery_no for plan in plans if plan.operation != "unchanged"],
+        )
+
         conn.execute(
             "UPDATE import_batches SET inserted = ?, updated = ?, deleted = ?, "
             "unchanged = ?, summary_records = ? WHERE id = ?",
@@ -683,5 +742,227 @@ def apply_import(conn, filename: str, records: Sequence[FollowupRecord]) -> Impo
         deleted=deleted,
         unchanged=unchanged,
         summary_records=summary_records,
+        batch_id=batch_id,
+    )
+
+
+# --------------------------------------------------------------------------
+# Pilot roster CSV
+# --------------------------------------------------------------------------
+
+ROSTER_REQUIRED_FIELDS = ("battery_no", "pilot_start")
+
+
+def parse_roster_csv(
+    data: bytes, *, max_rows: int = MAX_ROWS
+) -> list[RosterRecord]:
+    """Parse and validate a pilot-roster CSV without touching the database."""
+
+    header, rows = _read_table(data, max_rows)
+    columns = _map_columns(header, ROSTER_REQUIRED_FIELDS)
+
+    records: list[RosterRecord] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for line_no, row in rows:
+        if len(row) > len(header):
+            extra = [cell for cell in row[len(header) :] if cell.strip()]
+            if extra:
+                errors.append(f"第 {line_no} 行：列数多于表头，请检查逗号是否未加引号。")
+                continue
+        if len(row) < len(header):
+            row = row + [""] * (len(header) - len(row))
+
+        def cell(field: str) -> str:
+            index = columns.get(field)
+            return row[index] if index is not None and index < len(row) else ""
+
+        battery_no = cell("battery_no").strip()
+        problem = _battery_no_error(battery_no, line_no, seen)
+        if problem:
+            errors.append(problem)
+            continue
+        seen.add(battery_no)
+
+        try:
+            action = _parse_action(cell("action"), line_no)
+        except ImportValidationError as exc:
+            errors.extend(exc.messages)
+            continue
+        if action == "delete":
+            records.append(
+                RosterRecord(
+                    battery_no=battery_no,
+                    pilot_start=None,
+                    action=action,
+                    line_no=line_no,
+                )
+            )
+            continue
+
+        try:
+            pilot_start = parse_date(
+                cell("pilot_start"),
+                field=FIELD_LABELS["pilot_start"],
+                line_no=line_no,
+            )
+        except ImportValidationError as exc:
+            errors.extend(exc.messages)
+            continue
+
+        records.append(
+            RosterRecord(
+                battery_no=battery_no,
+                pilot_start=pilot_start,
+                action=action,
+                line_no=line_no,
+            )
+        )
+
+    if errors:
+        raise ImportValidationError(errors)
+    if not records:
+        raise ImportValidationError("CSV 没有可导入的数据行。")
+    return records
+
+
+def _load_existing_roster(conn, battery_nos: Sequence[str]) -> dict[str, str]:
+    existing: dict[str, str] = {}
+    for chunk in _chunks(battery_nos):
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            "SELECT battery_no, pilot_start FROM pilot_roster "
+            f"WHERE battery_no IN ({placeholders})",
+            list(chunk),
+        ):
+            existing[row[0]] = row[1]
+    return existing
+
+
+def _plan_roster(
+    records: Sequence[RosterRecord], existing: dict[str, str]
+) -> list[tuple[str, RosterRecord]]:
+    plans: list[tuple[str, RosterRecord]] = []
+    errors: list[str] = []
+
+    for record in records:
+        old_start = existing.get(record.battery_no)
+        if record.action == "delete":
+            if old_start is None:
+                errors.append(
+                    f"第 {record.line_no} 行：电池号“{record.battery_no}”"
+                    "不在试点名单中，无法删除。"
+                )
+                continue
+            plans.append(("delete", record))
+            continue
+
+        if record.pilot_start is None:  # pragma: no cover - guarded by parser
+            errors.append(f"第 {record.line_no} 行：试点开始日不能为空。")
+            continue
+        new_start = record.pilot_start.isoformat()
+        if old_start is None:
+            if record.action == "update":
+                errors.append(
+                    f"第 {record.line_no} 行：电池号“{record.battery_no}”"
+                    "不在试点名单中，无法更正。"
+                )
+                continue
+            plans.append(("insert", record))
+        else:
+            if record.action == "insert":
+                errors.append(
+                    f"第 {record.line_no} 行：电池号“{record.battery_no}”"
+                    "已在试点名单中；如需修正请留空操作、使用“更正”，或先“删除”。"
+                )
+                continue
+            if old_start == new_start:
+                plans.append(("unchanged", record))
+                continue
+            plans.append(("update", record))
+
+    if errors:
+        raise ImportValidationError(errors)
+    return plans
+
+
+def apply_roster_import(
+    conn, filename: str, records: Sequence[RosterRecord]
+) -> RosterResult:
+    """Apply a parsed roster file atomically.
+
+    The roster rows, the rebuilt segment summaries for the affected
+    batteries and the batch row commit or roll back together, so a failed
+    import leaves the previous comparison results queryable.
+    """
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    battery_nos = [record.battery_no for record in records]
+
+    conn.execute("BEGIN IMMEDIATE")
+    committed = False
+    inserted = updated = deleted = unchanged = 0
+    batch_id = 0
+    try:
+        existing = _load_existing_roster(conn, battery_nos)
+        plans = _plan_roster(records, existing)
+
+        batch_id = int(
+            conn.execute(
+                "INSERT INTO roster_batches "
+                "(filename, imported_at, total_rows, inserted, updated, deleted, "
+                "unchanged) VALUES (?, ?, ?, 0, 0, 0, 0)",
+                (filename, now, len(records)),
+            ).lastrowid
+        )
+
+        affected: list[str] = []
+        for operation, record in plans:
+            if operation == "unchanged":
+                unchanged += 1
+                continue
+            if operation == "delete":
+                conn.execute(
+                    "DELETE FROM pilot_roster WHERE battery_no = ?",
+                    (record.battery_no,),
+                )
+                deleted += 1
+            elif operation == "insert":
+                conn.execute(
+                    "INSERT INTO pilot_roster "
+                    "(battery_no, pilot_start, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (record.battery_no, record.pilot_start.isoformat(), now, now),
+                )
+                inserted += 1
+            else:
+                conn.execute(
+                    "UPDATE pilot_roster SET pilot_start = ?, updated_at = ? "
+                    "WHERE battery_no = ?",
+                    (record.pilot_start.isoformat(), now, record.battery_no),
+                )
+                updated += 1
+            affected.append(record.battery_no)
+
+        # Rebuild segment summaries only for the batteries this batch touches.
+        rebuild_segments_for(conn, affected)
+
+        conn.execute(
+            "UPDATE roster_batches SET inserted = ?, updated = ?, deleted = ?, "
+            "unchanged = ? WHERE id = ?",
+            (inserted, updated, deleted, unchanged, batch_id),
+        )
+        conn.execute("COMMIT")
+        committed = True
+    finally:
+        if not committed:
+            conn.execute("ROLLBACK")
+
+    return RosterResult(
+        total_rows=len(records),
+        inserted=inserted,
+        updated=updated,
+        deleted=deleted,
+        unchanged=unchanged,
         batch_id=batch_id,
     )

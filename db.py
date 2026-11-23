@@ -1,6 +1,6 @@
 """SQLite storage for the battery follow-up ledger and survival summaries.
 
-Three pieces of state are written together by every import:
+These pieces of state are written together by every import:
 
 ``battery_ledger``
     The auditable ledger: one current row per battery.
@@ -17,6 +17,15 @@ Three pieces of state are written together by every import:
 ``summary_counts``
     Pre-aggregated counts keyed by activation date and day offsets.  The HTML
     analysis page reads only this table, never the ledger.
+``pilot_roster``
+    The pilot roster: one current row per battery with its UTC pilot start
+    date.  Corrections overwrite the row.  The roster may be uploaded before
+    any follow-up is registered.
+``battery_segments``
+    Per-battery follow-up segments, each lying entirely in one (pilot group,
+    age layer) cell.  Imports rebuild segments only for the batteries they
+    touch; the comparison page reads only this table and never expands a
+    follow-up day by day.
 """
 
 from __future__ import annotations
@@ -27,6 +36,8 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Sequence
+
+from analysis import compute_segments
 
 MAX_SUMMARY_RECORDS_PER_BATTERY = 6
 
@@ -85,6 +96,42 @@ CREATE TABLE IF NOT EXISTS import_batches (
     deleted         INTEGER NOT NULL DEFAULT 0,
     unchanged       INTEGER NOT NULL,
     summary_records INTEGER NOT NULL
+);
+
+-- Pilot roster: one current row per battery.  Re-uploading the same battery
+-- number corrects the start date in place.  The roster is independent of the
+-- follow-up ledger and may be registered first.
+CREATE TABLE IF NOT EXISTS pilot_roster (
+    battery_no      TEXT PRIMARY KEY,
+    pilot_start     TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+-- Per-battery follow-up segments, each fully inside one (group, age layer)
+-- cell.  Rebuilt only for the batteries an import batch touches; the
+-- comparison page reads only this table and clips segments to the requested
+-- date range arithmetically, never day by day.
+CREATE TABLE IF NOT EXISTS battery_segments (
+    battery_no      TEXT NOT NULL,
+    seg_start       TEXT NOT NULL,
+    seg_end         TEXT NOT NULL,
+    seg_group       TEXT NOT NULL CHECK (seg_group IN ('pilot', 'control')),
+    age_layer       TEXT NOT NULL CHECK (age_layer IN ('lt180', 'ge180')),
+    failure_on_end  INTEGER NOT NULL DEFAULT 0 CHECK (failure_on_end IN (0, 1)),
+    PRIMARY KEY (battery_no, seg_start),
+    CHECK (seg_end >= seg_start)
+);
+
+CREATE TABLE IF NOT EXISTS roster_batches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename        TEXT NOT NULL,
+    imported_at     TEXT NOT NULL,
+    total_rows      INTEGER NOT NULL,
+    inserted        INTEGER NOT NULL,
+    updated         INTEGER NOT NULL,
+    deleted         INTEGER NOT NULL DEFAULT 0,
+    unchanged       INTEGER NOT NULL
 );
 """
 
@@ -154,6 +201,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE import_batches ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0"
         )
+
+    # Schema version 1: backfill battery_segments for the follow-ups that
+    # already live in the volume, so existing data joins the pilot comparison
+    # directly.  The rebuild is idempotent; if it is interrupted the version
+    # stays below 1 and the next startup runs it again.
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < 1:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rebuild_all_segments(conn)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("PRAGMA user_version = 1")
 
 
 def _adjust_count(conn: sqlite3.Connection, record: SummaryRecord, delta: int) -> None:
@@ -243,6 +305,7 @@ def rebuild_summary(conn: sqlite3.Connection) -> None:
     """Recompute ``battery_summary`` and ``summary_counts`` from the ledger.
 
     Maintenance/recovery helper; normal imports update both incrementally.
+    Also rebuilds the comparison segments so all summaries stay consistent.
     """
 
     from collections import Counter
@@ -292,9 +355,86 @@ def rebuild_summary(conn: sqlite3.Connection) -> None:
         ],
     )
 
+    rebuild_all_segments(conn)
+
 
 def ledger_rows(conn: sqlite3.Connection):
     return conn.execute(
         "SELECT battery_no, activation_date, followup_start, followup_end, outcome "
         "FROM battery_ledger ORDER BY battery_no"
     )
+
+
+def roster_rows(conn: sqlite3.Connection):
+    return conn.execute(
+        "SELECT battery_no, pilot_start, updated_at FROM pilot_roster "
+        "ORDER BY battery_no"
+    )
+
+
+_SEGMENT_SELECT = (
+    "SELECT l.battery_no, l.activation_date, l.followup_start, l.followup_end, "
+    "l.outcome, r.pilot_start FROM battery_ledger l "
+    "LEFT JOIN pilot_roster r ON r.battery_no = l.battery_no "
+)
+
+
+def _insert_segments(conn: sqlite3.Connection, rows) -> None:
+    payload: list[tuple[str, str, str, str, str, int]] = []
+    for battery_no, activation, start, end, outcome, pilot_start in rows:
+        segments = compute_segments(
+            date.fromisoformat(activation),
+            date.fromisoformat(start),
+            date.fromisoformat(end),
+            outcome,
+            date.fromisoformat(pilot_start) if pilot_start else None,
+        )
+        payload.extend(
+            (
+                battery_no,
+                segment.seg_start.isoformat(),
+                segment.seg_end.isoformat(),
+                segment.seg_group,
+                segment.age_layer,
+                1 if segment.failure_on_end else 0,
+            )
+            for segment in segments
+        )
+    conn.executemany(
+        "INSERT INTO battery_segments "
+        "(battery_no, seg_start, seg_end, seg_group, age_layer, failure_on_end) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        payload,
+    )
+
+
+def rebuild_segments_for(
+    conn: sqlite3.Connection, battery_nos: Sequence[str]
+) -> None:
+    """Rebuild segment summaries for just the given batteries.
+
+    Runs inside the caller's import transaction, so the segments commit or
+    roll back together with the raw roster/ledger data.  Batteries without a
+    current ledger row simply lose their segments.
+    """
+
+    nos = sorted({no for no in battery_nos if no})
+    for start in range(0, len(nos), 400):
+        chunk = nos[start : start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        conn.execute(
+            f"DELETE FROM battery_segments WHERE battery_no IN ({placeholders})",
+            chunk,
+        )
+        rows = conn.execute(
+            _SEGMENT_SELECT + f"WHERE l.battery_no IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        _insert_segments(conn, rows)
+
+
+def rebuild_all_segments(conn: sqlite3.Connection) -> None:
+    """Rebuild every segment summary (used by the schema migration)."""
+
+    conn.execute("DELETE FROM battery_segments")
+    _insert_segments(conn, conn.execute(_SEGMENT_SELECT).fetchall())

@@ -1,6 +1,7 @@
-"""Kaplan–Meier failure-free probability from the pre-aggregated counts.
+"""Kaplan–Meier failure-free probability and pilot-group comparison.
 
-Only ``summary_counts`` is read; ``battery_ledger`` is not touched by queries.
+Only pre-aggregated summary tables are read; ``battery_ledger`` is not
+touched by queries, and follow-ups are never expanded day by day.
 
 Counting rules
 --------------
@@ -20,8 +21,8 @@ from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
-from datetime import date
-from typing import Iterable
+from datetime import date, timedelta
+from typing import Iterable, Sequence
 
 Row = tuple[str, int, int, int, int]  # activation_date, entry, end, event, count
 
@@ -120,4 +121,205 @@ def summarize(rows: Iterable[Row], cutoff: date) -> SurvivalResult:
         points=points,
         enrolled_subjects=enrolled,
         risk_set_at_cutoff=risk_at_cutoff,
+    )
+
+
+# --------------------------------------------------------------------------
+# Pilot vs non-pilot comparison, stratified by battery age
+# --------------------------------------------------------------------------
+
+#: A follow-up day belongs to the "old" layer once the battery's age on that
+#: day reaches this many whole days.
+AGE_LAYER_THRESHOLD_DAYS = 180
+
+GROUP_PILOT = "pilot"
+GROUP_CONTROL = "control"
+LAYER_YOUNG = "lt180"
+LAYER_OLD = "ge180"
+GROUPS = (GROUP_PILOT, GROUP_CONTROL)
+LAYERS = (LAYER_YOUNG, LAYER_OLD)
+
+GROUP_LABELS = {GROUP_PILOT: "试点组", GROUP_CONTROL: "非试点组"}
+LAYER_LABELS = {
+    LAYER_YOUNG: f"机龄 < {AGE_LAYER_THRESHOLD_DAYS} 天",
+    LAYER_OLD: f"机龄 ≥ {AGE_LAYER_THRESHOLD_DAYS} 天",
+}
+
+
+@dataclass(frozen=True)
+class Segment:
+    """A homogeneous slice of a follow-up window: one group, one age layer."""
+
+    seg_start: date
+    seg_end: date
+    seg_group: str
+    age_layer: str
+    failure_on_end: bool
+
+    @property
+    def days(self) -> int:
+        return (self.seg_end - self.seg_start).days + 1
+
+
+def compute_segments(
+    activation: date,
+    followup_start: date,
+    followup_end: date,
+    outcome: str,
+    pilot_start: date | None,
+) -> list[Segment]:
+    """Split a follow-up window into homogeneous (group, age-layer) segments.
+
+    The inclusive window ``[followup_start, followup_end]`` is cut at the day
+    the battery turns ``AGE_LAYER_THRESHOLD_DAYS`` old and at the pilot start
+    day, so every segment lies entirely in one group and one age layer.  Pure
+    day arithmetic — the follow-up is never expanded day by day.
+
+    A failure belongs to the segment ending on the follow-up end day, i.e. it
+    is recorded only in the group and layer of its own day; that day still
+    counts as one follow-up day.
+    """
+
+    cuts: set[date] = set()
+    age_boundary = activation + timedelta(days=AGE_LAYER_THRESHOLD_DAYS)
+    if followup_start < age_boundary <= followup_end:
+        cuts.add(age_boundary)
+    if pilot_start is not None and followup_start < pilot_start <= followup_end:
+        cuts.add(pilot_start)
+
+    boundaries = [followup_start, *sorted(cuts), followup_end + timedelta(days=1)]
+    segments: list[Segment] = []
+    for seg_start, next_start in zip(boundaries, boundaries[1:]):
+        seg_end = next_start - timedelta(days=1)
+        age_days = (seg_start - activation).days
+        layer = LAYER_OLD if age_days >= AGE_LAYER_THRESHOLD_DAYS else LAYER_YOUNG
+        group = (
+            GROUP_PILOT
+            if pilot_start is not None and seg_start >= pilot_start
+            else GROUP_CONTROL
+        )
+        segments.append(
+            Segment(
+                seg_start=seg_start,
+                seg_end=seg_end,
+                seg_group=group,
+                age_layer=layer,
+                failure_on_end=outcome == "failure" and seg_end == followup_end,
+            )
+        )
+    return segments
+
+
+@dataclass(frozen=True)
+class CellStat:
+    """Follow-up battery-days and failures for one (group, layer) cell."""
+
+    days: int
+    failures: int
+
+
+@dataclass(frozen=True)
+class LayerWeight:
+    layer: str
+    days: int  # combined follow-up days of both groups in this layer
+    weight: float
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    start: date
+    end: date
+    cells: dict[tuple[str, str], CellStat]
+    common_layers: tuple[str, ...]
+    layer_weights: tuple[LayerWeight, ...]
+    pilot_rate_per_1000: float | None
+    control_rate_per_1000: float | None
+    difference_per_1000: float | None
+
+    @property
+    def comparable(self) -> bool:
+        return bool(self.common_layers)
+
+    @property
+    def total_days(self) -> int:
+        return sum(cell.days for cell in self.cells.values())
+
+    @property
+    def total_failures(self) -> int:
+        return sum(cell.failures for cell in self.cells.values())
+
+
+def compare_groups(
+    day_rows: Iterable[Sequence],
+    failure_rows: Iterable[Sequence],
+    start: date,
+    end: date,
+) -> ComparisonResult:
+    """Weighted per-1000-battery-day failure rates, pilot minus control.
+
+    ``day_rows`` and ``failure_rows`` are ``(group, layer, value)`` triples
+    aggregated from the segment summary for the inclusive range
+    ``[start, end]``.  Only layers where both groups have follow-up days are
+    used; each such layer is weighted by its share of the combined follow-up
+    days across those layers.  When no layer has follow-up in both groups the
+    result is not comparable and the rates are ``None``.
+    """
+
+    days = {(group, layer): 0 for group in GROUPS for layer in LAYERS}
+    failures = dict(days)
+    for group, layer, value in day_rows:
+        if (group, layer) in days and value is not None:
+            days[(group, layer)] += int(value)
+    for group, layer, value in failure_rows:
+        if (group, layer) in failures and value is not None:
+            failures[(group, layer)] += int(value)
+
+    cells = {key: CellStat(days=days[key], failures=failures[key]) for key in days}
+    common = tuple(
+        layer
+        for layer in LAYERS
+        if cells[(GROUP_PILOT, layer)].days > 0
+        and cells[(GROUP_CONTROL, layer)].days > 0
+    )
+    if not common:
+        return ComparisonResult(
+            start=start,
+            end=end,
+            cells=cells,
+            common_layers=(),
+            layer_weights=(),
+            pilot_rate_per_1000=None,
+            control_rate_per_1000=None,
+            difference_per_1000=None,
+        )
+
+    total = sum(cells[(group, layer)].days for layer in common for group in GROUPS)
+    weights = tuple(
+        LayerWeight(
+            layer=layer,
+            days=sum(cells[(group, layer)].days for group in GROUPS),
+            weight=sum(cells[(group, layer)].days for group in GROUPS) / total,
+        )
+        for layer in common
+    )
+
+    rates: dict[str, float] = {}
+    for group in GROUPS:
+        per_day = sum(
+            layer_weight.weight
+            * cells[(group, layer_weight.layer)].failures
+            / cells[(group, layer_weight.layer)].days
+            for layer_weight in weights
+        )
+        rates[group] = per_day * 1000.0
+
+    return ComparisonResult(
+        start=start,
+        end=end,
+        cells=cells,
+        common_layers=common,
+        layer_weights=weights,
+        pilot_rate_per_1000=rates[GROUP_PILOT],
+        control_rate_per_1000=rates[GROUP_CONTROL],
+        difference_per_1000=rates[GROUP_PILOT] - rates[GROUP_CONTROL],
     )
